@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Photosessions — тест</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --fg: #e8eef4;
+      --accent: #3d9cf0;
+      --muted: #8a9bb0;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background:
+        radial-gradient(ellipse at 20% 20%, #1a2a3a 0%, transparent 50%),
+        radial-gradient(ellipse at 80% 80%, #1a2535 0%, transparent 45%),
+        var(--bg);
+      color: var(--fg);
+      padding: 2rem;
+    }
+    main {
+      max-width: 36rem;
+      text-align: center;
+    }
+    h1 {
+      font-size: clamp(1.75rem, 5vw, 2.5rem);
+      font-weight: 650;
+      letter-spacing: -0.02em;
+      margin-bottom: 0.75rem;
+    }
+    p {
+      color: var(--muted);
+      line-height: 1.6;
+      margin-bottom: 1.5rem;
+    }
+    .badge {
+      display: inline-block;
+      padding: 0.35rem 0.75rem;
+      border: 1px solid rgba(61, 156, 240, 0.4);
+      color: var(--accent);
+      border-radius: 999px;
+      font-size: 0.85rem;
+      margin-bottom: 1.25rem;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="badge">тест · GitHub</div>
+    <h1>AI Photosessions</h1>
+    <p>Тестовая страница. Если вы видите этот файл в репозитории — загрузка на GitHub прошла успешно.</p>
+  </main>
+</body>
+</html>
