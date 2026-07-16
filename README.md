@@ -2,28 +2,35 @@
 
 Сервис ИИ-фотосессий. Генерация через [kie.ai](https://kie.ai/) — модель **Nano Banana Pro**.
 
-## Быстрый старт
+## Веб-демо
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # затем впишите KIE_API_KEY
-python generate.py "портрет в студии, мягкий свет"
+cp .env.example .env   # KIE_API_KEY, PUBLIC_BASE_URL
+python app.py          # http://SERVER:8080
 ```
 
-Результат сохранится в `outputs/`.
-
-### Опции
+## Telegram-бот
 
 ```bash
-python generate.py "ваш промпт" --aspect-ratio 9:16 --resolution 1K --format png
-python generate.py "edit this" --image https://example.com/photo.jpg
-python generate.py "test" --no-download   # только URL, без скачивания
+# в .env: TELEGRAM_BOT_TOKEN, TELEGRAM_DAILY_LIMIT
+python bot.py          # long polling
+```
+
+Сценарий: фото (до 8, необязательно) → промпт → качество → формат → результат.
+
+Бот: [@aiphotosessions_bot](https://t.me/aiphotosessions_bot)
+
+## CLI
+
+```bash
+python generate.py "портрет в студии, мягкий свет"
 ```
 
 ## Важно
 
-- Файл `.env` с ключом **не коммитьте** (уже в `.gitignore`).
-- Ключ: https://kie.ai/api-key
+- Файл `.env` с ключами **не коммитьте** (уже в `.gitignore`).
+- Ключ kie.ai: https://kie.ai/api-key
 - Документация API: https://docs.kie.ai/
