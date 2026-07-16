@@ -14,7 +14,15 @@ from urllib.parse import urlparse
 import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request, send_from_directory
-from werkzeug.utils import secure_filename
+from PIL import Image, ImageOps
+
+try:
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+    HEIF_SUPPORTED = True
+except Exception:  # noqa: BLE001
+    HEIF_SUPPORTED = False
 
 load_dotenv()
 
@@ -30,8 +38,17 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://62.113.110.123:8080").rst
 CREATE_URL = f"{API_BASE}/api/v1/jobs/createTask"
 STATUS_URL = f"{API_BASE}/api/v1/jobs/recordInfo"
 
-ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
-ALLOWED_MIMES = {"image/jpeg", "image/png", "image/webp"}
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
+ALLOWED_MIMES = {
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/heic",
+    "image/heif",
+    "image/heic-sequence",
+    "image/heif-sequence",
+    "application/octet-stream",  # iOS sometimes sends HEIC this way
+}
 ALLOWED_RESOLUTIONS = {"1K", "2K", "4K"}
 ALLOWED_ASPECT_RATIOS = {
     "1:1",
@@ -131,10 +148,34 @@ def safe_stem(text: str) -> str:
     return cleaned or "image"
 
 
-def extension_for_upload(filename: str, mime: str) -> str:
+def is_allowed_upload(filename: str, mime: str) -> bool:
     suffix = Path(filename or "").suffix.lower()
     if suffix in ALLOWED_EXTENSIONS:
-        return suffix
+        return True
+    if mime in ALLOWED_MIMES and mime != "application/octet-stream":
+        return True
+    # octet-stream is allowed only for HEIC/HEIF filenames
+    if mime == "application/octet-stream" and suffix in {".heic", ".heif"}:
+        return True
+    return False
+
+
+def is_heic_upload(filename: str, mime: str) -> bool:
+    suffix = Path(filename or "").suffix.lower()
+    if suffix in {".heic", ".heif"}:
+        return True
+    return mime in {
+        "image/heic",
+        "image/heif",
+        "image/heic-sequence",
+        "image/heif-sequence",
+    }
+
+
+def extension_for_passthrough(filename: str, mime: str) -> str:
+    suffix = Path(filename or "").suffix.lower()
+    if suffix in {".jpg", ".jpeg", ".png", ".webp"}:
+        return ".jpg" if suffix == ".jpeg" else suffix
     mime_map = {
         "image/jpeg": ".jpg",
         "image/png": ".png",
@@ -142,11 +183,35 @@ def extension_for_upload(filename: str, mime: str) -> str:
     }
     if mime in mime_map:
         return mime_map[mime]
-    raise ValueError("Допустимы только JPG, PNG или WEBP")
+    raise ValueError("Допустимы только JPG, PNG, WEBP или HEIC/HEIF")
+
+
+def convert_heic_to_jpeg(storage, dest: Path) -> None:
+    """Decode HEIC/HEIF (iPhone) and save as JPEG."""
+    try:
+        image = Image.open(storage.stream)
+        image = ImageOps.exif_transpose(image)
+        if image.mode in ("RGBA", "LA"):
+            background = Image.new("RGB", image.size, (255, 255, 255))
+            alpha = image.getchannel("A") if "A" in image.getbands() else None
+            background.paste(image, mask=alpha)
+            image = background
+        elif image.mode != "RGB":
+            image = image.convert("RGB")
+        image.save(dest, format="JPEG", quality=92, optimize=True)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(
+            f"Не удалось конвертировать HEIC/HEIF в JPEG: {storage.filename}. "
+            f"{'На сервере нет поддержки HEIC.' if not HEIF_SUPPORTED else ''}"
+            f" Детали: {exc}"
+        ) from exc
 
 
 def save_reference_uploads(files) -> list[str]:
-    """Save uploaded references and return public URLs for kie.ai image_input."""
+    """Save uploaded references and return public URLs for kie.ai.
+
+    HEIC/HEIF are converted to JPEG; JPG/PNG/WEBP are stored unchanged.
+    """
     if not files:
         return []
     if len(files) > MAX_REFERENCE_IMAGES:
@@ -157,8 +222,11 @@ def save_reference_uploads(files) -> list[str]:
         if not storage or not storage.filename:
             continue
         mime = (storage.mimetype or "").lower()
-        if mime not in ALLOWED_MIMES:
-            raise ValueError(f"Неверный тип файла: {storage.filename} ({mime or 'unknown'})")
+        if not is_allowed_upload(storage.filename, mime):
+            raise ValueError(
+                f"Неверный тип файла: {storage.filename} ({mime or 'unknown'}). "
+                "Допустимы JPG, PNG, WEBP, HEIC/HEIF"
+            )
 
         storage.stream.seek(0, os.SEEK_END)
         size = storage.stream.tell()
@@ -166,12 +234,21 @@ def save_reference_uploads(files) -> list[str]:
         if size <= 0:
             raise ValueError(f"Пустой файл: {storage.filename}")
         if size > MAX_FILE_BYTES:
-            raise ValueError(f"Файл слишком большой (макс. {MAX_FILE_BYTES // (1024 * 1024)} МБ): {storage.filename}")
+            raise ValueError(
+                f"Файл слишком большой (макс. {MAX_FILE_BYTES // (1024 * 1024)} МБ): {storage.filename}"
+            )
 
-        ext = extension_for_upload(secure_filename(storage.filename), mime)
-        filename = f"{int(time.time())}_{uuid.uuid4().hex[:10]}{ext}"
-        dest = UPLOADS_DIR / filename
-        storage.save(dest)
+        stem = f"{int(time.time())}_{uuid.uuid4().hex[:10]}"
+        if is_heic_upload(storage.filename, mime):
+            filename = f"{stem}.jpg"
+            dest = UPLOADS_DIR / filename
+            convert_heic_to_jpeg(storage, dest)
+        else:
+            ext = extension_for_passthrough(storage.filename, mime)
+            filename = f"{stem}{ext}"
+            dest = UPLOADS_DIR / filename
+            storage.save(dest)
+
         urls.append(f"{PUBLIC_BASE_URL}/uploads/{filename}")
 
     return urls
