@@ -4,16 +4,17 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 import time
 import uuid
 from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
+from typing import Any, Awaitable, Callable
 
 import requests
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -23,6 +24,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    TelegramObject,
 )
 from dotenv import load_dotenv
 from werkzeug.datastructures import FileStorage
@@ -37,26 +39,47 @@ from app import (
     save_reference_uploads,
     wait_for_result,
 )
+from logging_setup import setup_logging
 
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 DAILY_LIMIT = int(os.getenv("TELEGRAM_DAILY_LIMIT", "15"))
+# Telegram sendPhoto limit is 10 MB; sendDocument allows up to 50 MB.
+TG_PHOTO_MAX_BYTES = 10 * 1024 * 1024
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("tg-bot")
+log = setup_logging("tg-bot", "bot.log")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 
-# user_id -> (day_key, count)
 _usage: dict[int, tuple[str, int]] = {}
 _gen_lock = asyncio.Lock()
 _user_photo_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 _album_lock = asyncio.Lock()
-# key = f"{user_id}:{media_group_id}" -> pending album buffer
 _albums: dict[str, dict] = {}
 ALBUM_WAIT_SEC = 1.5
+
+
+class UpdateLoggingMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        update = data.get("event_update")
+        update_id = getattr(update, "update_id", "?")
+        user = data.get("event_from_user")
+        user_label = f"user={user.id}" if user else "user=?"
+        event_name = event.__class__.__name__
+        log.info("update=%s %s event=%s", update_id, user_label, event_name)
+        try:
+            return await handler(event, data)
+        except Exception:
+            log.exception("update=%s %s failed event=%s", update_id, user_label, event_name)
+            raise
+
 
 class GenFSM(StatesGroup):
     collecting = State()
@@ -142,6 +165,116 @@ HELP_TEXT = (
 )
 
 
+def _generate_sync(prompt: str, image_urls: list[str], resolution: str, aspect_ratio: str) -> dict:
+    started = time.time()
+    log.info(
+        "kie.create start refs=%s resolution=%s aspect=%s prompt_len=%s",
+        len(image_urls),
+        resolution,
+        aspect_ratio,
+        len(prompt),
+    )
+    task_id = create_task(
+        prompt,
+        aspect_ratio=aspect_ratio,
+        resolution=resolution,
+        output_format="png",
+        image_urls=image_urls,
+    )
+    log.info("kie.create ok taskId=%s", task_id)
+    data = wait_for_result(task_id)
+    urls = extract_urls(data)
+    url = urls[0]
+    ext = guess_extension(url, "png")
+    filename = f"{int(time.time())}_{safe_stem(prompt)}_{uuid.uuid4().hex[:8]}_1{ext}"
+    dest = GENERATED_DIR / filename
+    response = requests.get(url, timeout=120)
+    response.raise_for_status()
+    dest.write_bytes(response.content)
+    elapsed = round(time.time() - started, 1)
+    log.info(
+        "kie.done taskId=%s file=%s size=%s bytes elapsed=%ss",
+        task_id,
+        dest.name,
+        dest.stat().st_size,
+        elapsed,
+    )
+    return {"path": str(dest), "taskId": task_id, "reference_urls": image_urls}
+
+
+async def _send_generated_result(
+    message: Message,
+    *,
+    path: Path,
+    resolution: str,
+    aspect: str,
+    user_id: int,
+    task_id: str,
+) -> None:
+    file_bytes = path.read_bytes()
+    file_size = len(file_bytes)
+    size_mb = file_size / (1024 * 1024)
+    caption = (
+        f"Готово · {resolution} · {aspect}\n"
+        f"taskId: {task_id}\n"
+        f"Осталось сегодня: {remaining_quota(user_id)}"
+    )
+
+    log.info(
+        "telegram.send start user=%s taskId=%s file=%s size_mb=%.2f",
+        user_id,
+        task_id,
+        path.name,
+        size_mb,
+    )
+
+    if file_size <= TG_PHOTO_MAX_BYTES:
+        try:
+            await message.answer_photo(
+                BufferedInputFile(file_bytes, filename=path.name),
+                caption=caption,
+            )
+            log.info("telegram.send photo ok user=%s taskId=%s", user_id, task_id)
+        except TelegramBadRequest as exc:
+            log.warning(
+                "telegram.send photo failed user=%s taskId=%s error=%s",
+                user_id,
+                task_id,
+                exc,
+            )
+            await message.answer("Превью не отправилось, отправляю файл документом…")
+    else:
+        log.warning(
+            "telegram.skip photo user=%s taskId=%s size_mb=%.2f limit_mb=10",
+            user_id,
+            task_id,
+            size_mb,
+        )
+        await message.answer(
+            f"Файл {size_mb:.1f} МБ — слишком большой для превью в Telegram (лимит 10 МБ).\n"
+            "Отправляю документом для скачивания."
+        )
+
+    try:
+        await message.answer_document(
+            BufferedInputFile(file_bytes, filename=path.name),
+            caption="Файл для скачивания",
+        )
+        log.info("telegram.send document ok user=%s taskId=%s", user_id, task_id)
+    except TelegramBadRequest as exc:
+        log.error(
+            "telegram.send document failed user=%s taskId=%s error=%s",
+            user_id,
+            task_id,
+            exc,
+        )
+        await message.answer(
+            "Генерация завершилась, но Telegram не принял файл.\n"
+            f"taskId: {task_id}\n"
+            "Попробуйте качество 1K."
+        )
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
@@ -213,7 +346,6 @@ async def _append_photos_and_reply(
     state: FSMContext,
     new_urls: list[str],
 ) -> None:
-    """Atomically append reference URLs and send one status message."""
     if not new_urls:
         return
 
@@ -227,15 +359,14 @@ async def _append_photos_and_reply(
                 f"Уже максимум {MAX_REFERENCE_IMAGES} фото. Пришлите промпт текстом."
             )
             return
-        if len(new_urls) > free:
+        truncated = len(new_urls) > free
+        if truncated:
             new_urls = new_urls[:free]
-            truncated = True
-        else:
-            truncated = False
         photos.extend(new_urls)
         await state.update_data(photos=photos)
         count = len(photos)
 
+    log.info("refs.added user=%s count=%s added=%s", user_id, count, len(new_urls))
     text = _photo_added_text(count)
     if truncated:
         text += f"\nЧасть фото не принята: лимит {MAX_REFERENCE_IMAGES}."
@@ -270,6 +401,7 @@ async def _handle_incoming_image(
             filename = downloaded_name or filename
         url = await asyncio.to_thread(_save_one_reference, raw, filename, mime)
     except Exception as exc:  # noqa: BLE001
+        log.exception("refs.save_failed user=%s error=%s", message.from_user.id, exc)
         await message.answer(f"Не удалось сохранить фото: {exc}")
         return
 
@@ -278,7 +410,6 @@ async def _handle_incoming_image(
         await _append_photos_and_reply(message, state, [url])
         return
 
-    # Album: collect all items, reply once with total count
     album_key = f"{message.from_user.id}:{media_group_id}"
     async with _album_lock:
         album = _albums.get(album_key)
@@ -297,12 +428,11 @@ async def _handle_incoming_image(
 @dp.message(GenFSM.collecting, F.photo)
 async def on_photo(message: Message, state: FSMContext) -> None:
     photo = message.photo[-1]
-    name = f"{photo.file_unique_id}.jpg"
     await _handle_incoming_image(
         message,
         state,
         file_id=photo.file_id,
-        filename=name,
+        filename=f"{photo.file_unique_id}.jpg",
         mime="image/jpeg",
     )
 
@@ -338,13 +468,12 @@ async def on_prompt(message: Message, state: FSMContext) -> None:
         await message.answer("Промпт слишком длинный (макс. 10000 символов).")
         return
 
-    left = remaining_quota(message.from_user.id)
+    user_id = message.from_user.id
+    left = remaining_quota(user_id)
     if left <= 0:
         await message.answer(f"Дневной лимит исчерпан ({DAILY_LIMIT}/сутки). Попробуйте завтра.")
         return
 
-    # If an album is still being collected, wait for it to flush
-    user_id = message.from_user.id
     for _ in range(10):
         async with _album_lock:
             pending = any(k.startswith(f"{user_id}:") for k in _albums)
@@ -356,6 +485,7 @@ async def on_prompt(message: Message, state: FSMContext) -> None:
     photos = data.get("photos") or []
     await state.update_data(prompt=prompt)
     await state.set_state(GenFSM.choose_resolution)
+    log.info("prompt.accepted user=%s refs=%s prompt_len=%s", user_id, len(photos), len(prompt))
     await message.answer(
         f"Промпт принят. Референсов: {len(photos)}.\nВыберите качество:",
         reply_markup=resolution_keyboard(),
@@ -400,6 +530,14 @@ async def on_aspect(callback: CallbackQuery, state: FSMContext) -> None:
         f"Генерация {resolution} {aspect}, референсов: {len(photos)}…\nОбычно 20–90 секунд."
     )
     await callback.answer()
+    log.info(
+        "generate.request user=%s resolution=%s aspect=%s refs=%s prompt_len=%s",
+        user_id,
+        resolution,
+        aspect,
+        len(photos),
+        len(prompt),
+    )
 
     try:
         async with _gen_lock:
@@ -411,40 +549,18 @@ async def on_aspect(callback: CallbackQuery, state: FSMContext) -> None:
                 aspect,
             )
     except Exception as exc:  # noqa: BLE001
-        log.exception("generation failed")
+        log.exception("generate.failed user=%s error=%s", user_id, exc)
         await callback.message.answer(f"Ошибка генерации: {exc}")
         return
 
-    path = Path(result["path"])
-    caption = f"Готово · {resolution} · {aspect}\nОсталось сегодня: {remaining_quota(user_id)}"
-    await callback.message.answer_photo(
-        BufferedInputFile(path.read_bytes(), filename=path.name),
-        caption=caption,
-    )
-    await callback.message.answer_document(
-        BufferedInputFile(path.read_bytes(), filename=path.name),
-        caption="Файл для скачивания",
-    )
-
-
-def _generate_sync(prompt: str, image_urls: list[str], resolution: str, aspect_ratio: str) -> dict:
-    task_id = create_task(
-        prompt,
-        aspect_ratio=aspect_ratio,
+    await _send_generated_result(
+        callback.message,
+        path=Path(result["path"]),
         resolution=resolution,
-        output_format="png",
-        image_urls=image_urls,
+        aspect=aspect,
+        user_id=user_id,
+        task_id=result["taskId"],
     )
-    data = wait_for_result(task_id)
-    urls = extract_urls(data)
-    url = urls[0]
-    ext = guess_extension(url, "png")
-    filename = f"{int(time.time())}_{safe_stem(prompt)}_{uuid.uuid4().hex[:8]}_1{ext}"
-    dest = GENERATED_DIR / filename
-    response = requests.get(url, timeout=120)
-    response.raise_for_status()
-    dest.write_bytes(response.content)
-    return {"path": str(dest), "taskId": task_id, "reference_urls": image_urls}
 
 
 @dp.message(F.text)
@@ -457,6 +573,7 @@ async def fallback_text(message: Message, state: FSMContext) -> None:
 async def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
         raise SystemExit("TELEGRAM_BOT_TOKEN is missing in .env")
+    dp.update.middleware(UpdateLoggingMiddleware())
     me = await bot.get_me()
     log.info("Bot started as @%s (%s)", me.username, me.id)
     await dp.start_polling(bot)

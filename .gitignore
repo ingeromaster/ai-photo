@@ -6,6 +6,7 @@ __pycache__/
 outputs/
 generated/
 uploads/
+logs/
 *.png
 *.jpg
 *.jpeg
