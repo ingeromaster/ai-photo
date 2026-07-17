@@ -1,0 +1,16 @@
+[Unit]
+Description=AI Photosessions Telegram bot
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+WorkingDirectory=/root/ai-agent
+EnvironmentFile=/root/ai-agent/.env
+ExecStart=/root/ai-agent/.venv/bin/python /root/ai-agent/bot.py
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
