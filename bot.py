@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Telegram bot for Nano Banana Pro — same flow as the web demo."""
+"""Telegram bot for Nano Banana Pro (kie.ai)."""
 
 from __future__ import annotations
 
@@ -27,38 +27,47 @@ from aiogram.types import (
     TelegramObject,
 )
 from dotenv import load_dotenv
-from werkzeug.datastructures import FileStorage
 
-from app import (
+from db import ensure_user, list_telegram_ids, remaining_quota, try_consume_generation
+from kie_client import (
     GENERATED_DIR,
     MAX_REFERENCE_IMAGES,
     create_task,
     extract_urls,
     guess_extension,
     safe_stem,
-    save_reference_uploads,
+    save_reference_bytes,
     wait_for_result,
 )
 from logging_setup import setup_logging
+from uploads_server import start_uploads_server
 
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-DAILY_LIMIT = int(os.getenv("TELEGRAM_DAILY_LIMIT", "15"))
+ADMIN_IDS = {
+    int(x.strip())
+    for x in os.getenv("TELEGRAM_ADMIN_IDS", "").split(",")
+    if x.strip().isdigit()
+}
 # Telegram sendPhoto limit is 10 MB; sendDocument allows up to 50 MB.
 TG_PHOTO_MAX_BYTES = 10 * 1024 * 1024
+BROADCAST_DELAY_SEC = 0.05
 
 log = setup_logging("tg-bot", "bot.log")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 
-_usage: dict[int, tuple[str, int]] = {}
 _gen_lock = asyncio.Lock()
 _user_photo_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 _album_lock = asyncio.Lock()
 _albums: dict[str, dict] = {}
 ALBUM_WAIT_SEC = 1.5
+
+
+def is_admin(user_id: int | None) -> bool:
+    return bool(user_id and user_id in ADMIN_IDS)
 
 
 class UpdateLoggingMiddleware(BaseMiddleware):
@@ -105,28 +114,6 @@ ASPECTS = [
 ]
 
 
-def day_key() -> str:
-    return time.strftime("%Y-%m-%d")
-
-
-def remaining_quota(user_id: int) -> int:
-    key, count = _usage.get(user_id, (day_key(), 0))
-    if key != day_key():
-        return DAILY_LIMIT
-    return max(0, DAILY_LIMIT - count)
-
-
-def consume_quota(user_id: int) -> bool:
-    key, count = _usage.get(user_id, (day_key(), 0))
-    if key != day_key():
-        key, count = day_key(), 0
-    if count >= DAILY_LIMIT:
-        _usage[user_id] = (key, count)
-        return False
-    _usage[user_id] = (key, count + 1)
-    return True
-
-
 def resolution_keyboard() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text=label, callback_data=f"res:{value}")]
@@ -161,8 +148,18 @@ HELP_TEXT = (
     "/start — справка\n"
     "/new — начать заново\n"
     "/cancel — отменить текущую сессию\n\n"
-    f"Лимит на тест: {DAILY_LIMIT} генераций в сутки на человека."
+    "Лимит: 10 генераций на аккаунт (можно увеличить у администратора)."
 )
+
+
+async def _sync_user(message: Message) -> dict:
+    user = message.from_user
+    return await asyncio.to_thread(
+        ensure_user,
+        user.id,
+        username=user.username,
+        first_name=user.first_name,
+    )
 
 
 def _generate_sync(prompt: str, image_urls: list[str], resolution: str, aspect_ratio: str) -> dict:
@@ -210,6 +207,7 @@ async def _send_generated_result(
     aspect: str,
     user_id: int,
     task_id: str,
+    left_count: int,
 ) -> None:
     file_bytes = path.read_bytes()
     file_size = len(file_bytes)
@@ -217,7 +215,7 @@ async def _send_generated_result(
     caption = (
         f"Готово · {resolution} · {aspect}\n"
         f"taskId: {task_id}\n"
-        f"Осталось сегодня: {remaining_quota(user_id)}"
+        f"Осталось генераций: {left_count}"
     )
 
     log.info(
@@ -280,8 +278,11 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await state.set_state(GenFSM.collecting)
     await state.update_data(photos=[], prompt=None, resolution=None, aspect_ratio=None)
-    left = remaining_quota(message.from_user.id)
-    await message.answer(f"{HELP_TEXT}\nОсталось сегодня: {left}")
+    user = await _sync_user(message)
+    await message.answer(
+        f"{HELP_TEXT}\n"
+        f"Осталось генераций: {user['left_count']}"
+    )
 
 
 @dp.message(Command("new"))
@@ -290,6 +291,67 @@ async def cmd_new(message: Message, state: FSMContext) -> None:
     await state.set_state(GenFSM.collecting)
     await state.update_data(photos=[], prompt=None, resolution=None, aspect_ratio=None)
     await message.answer("Сессия сброшена. Пришлите фото (до 8) и/или промпт.")
+
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: Message) -> None:
+    if not is_admin(message.from_user.id if message.from_user else None):
+        await message.answer("Команда только для администратора.")
+        return
+
+    text = (message.text or "")
+    # Support "/broadcast text" and "/broadcast@bot text"
+    parts = text.split(maxsplit=1)
+    payload = parts[1].strip() if len(parts) > 1 else ""
+    if not payload:
+        await message.answer(
+            "Использование:\n"
+            "/broadcast Текст сообщения для всех пользователей\n\n"
+            "Пример:\n"
+            "/broadcast Всем привет! Добавили формат 2K."
+        )
+        return
+
+    user_ids = await asyncio.to_thread(list_telegram_ids)
+    if not user_ids:
+        await message.answer("В базе пока нет пользователей для рассылки.")
+        return
+
+    await message.answer(f"Рассылка запущена: {len(user_ids)} получателей…")
+    log.info("broadcast.start admin=%s recipients=%s", message.from_user.id, len(user_ids))
+
+    ok = 0
+    failed = 0
+    blocked = 0
+    for telegram_id in user_ids:
+        try:
+            await bot.send_message(telegram_id, payload)
+            ok += 1
+        except TelegramBadRequest as exc:
+            failed += 1
+            err = str(exc).lower()
+            if "blocked" in err or "deactivated" in err or "chat not found" in err:
+                blocked += 1
+            log.warning("broadcast.fail user=%s error=%s", telegram_id, exc)
+        except Exception as exc:  # noqa: BLE001
+            failed += 1
+            log.exception("broadcast.fail user=%s error=%s", telegram_id, exc)
+        await asyncio.sleep(BROADCAST_DELAY_SEC)
+
+    report = (
+        "Рассылка завершена.\n"
+        f"Успешно: {ok}\n"
+        f"Ошибки: {failed}\n"
+        f"Из них недоступны/блок: {blocked}"
+    )
+    log.info(
+        "broadcast.done admin=%s ok=%s failed=%s blocked=%s",
+        message.from_user.id,
+        ok,
+        failed,
+        blocked,
+    )
+    await message.answer(report)
 
 
 @dp.message(Command("cancel"))
@@ -327,11 +389,7 @@ def _guess_mime(filename: str) -> str:
 
 
 def _save_one_reference(data: bytes, filename: str, mime: str) -> str:
-    fs = FileStorage(stream=BytesIO(data), filename=filename, content_type=mime)
-    urls = save_reference_uploads([fs])
-    if not urls:
-        raise RuntimeError("empty upload")
-    return urls[0]
+    return save_reference_bytes(data, filename, mime)
 
 
 def _photo_added_text(count: int) -> str:
@@ -469,9 +527,13 @@ async def on_prompt(message: Message, state: FSMContext) -> None:
         return
 
     user_id = message.from_user.id
-    left = remaining_quota(user_id)
+    await _sync_user(message)
+    left = await asyncio.to_thread(remaining_quota, user_id)
     if left <= 0:
-        await message.answer(f"Дневной лимит исчерпан ({DAILY_LIMIT}/сутки). Попробуйте завтра.")
+        await message.answer(
+            "Лимит генераций исчерпан.\n"
+            "Напишите администратору, чтобы увеличить квоту."
+        )
         return
 
     for _ in range(10):
@@ -485,9 +547,11 @@ async def on_prompt(message: Message, state: FSMContext) -> None:
     photos = data.get("photos") or []
     await state.update_data(prompt=prompt)
     await state.set_state(GenFSM.choose_resolution)
-    log.info("prompt.accepted user=%s refs=%s prompt_len=%s", user_id, len(photos), len(prompt))
+    log.info("prompt.accepted user=%s refs=%s prompt_len=%s left=%s", user_id, len(photos), len(prompt), left)
     await message.answer(
-        f"Промпт принят. Референсов: {len(photos)}.\nВыберите качество:",
+        f"Промпт принят. Референсов: {len(photos)}.\n"
+        f"Осталось генераций: {left}\n"
+        "Выберите качество:",
         reply_markup=resolution_keyboard(),
     )
 
@@ -519,8 +583,18 @@ async def on_aspect(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     user_id = callback.from_user.id
-    if not consume_quota(user_id):
-        await callback.message.answer(f"Дневной лимит исчерпан ({DAILY_LIMIT}/сутки).")
+    await asyncio.to_thread(
+        ensure_user,
+        user_id,
+        username=callback.from_user.username,
+        first_name=callback.from_user.first_name,
+    )
+    consumed = await asyncio.to_thread(try_consume_generation, user_id)
+    if not consumed:
+        await callback.message.answer(
+            "Лимит генераций исчерпан.\n"
+            "Напишите администратору, чтобы увеличить квоту."
+        )
         await state.clear()
         await callback.answer()
         return
@@ -531,12 +605,13 @@ async def on_aspect(callback: CallbackQuery, state: FSMContext) -> None:
     )
     await callback.answer()
     log.info(
-        "generate.request user=%s resolution=%s aspect=%s refs=%s prompt_len=%s",
+        "generate.request user=%s resolution=%s aspect=%s refs=%s prompt_len=%s left_after=%s",
         user_id,
         resolution,
         aspect,
         len(photos),
         len(prompt),
+        consumed["left_count"],
     )
 
     try:
@@ -560,6 +635,7 @@ async def on_aspect(callback: CallbackQuery, state: FSMContext) -> None:
         aspect=aspect,
         user_id=user_id,
         task_id=result["taskId"],
+        left_count=consumed["left_count"],
     )
 
 
@@ -573,6 +649,8 @@ async def fallback_text(message: Message, state: FSMContext) -> None:
 async def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
         raise SystemExit("TELEGRAM_BOT_TOKEN is missing in .env")
+    uploads_port = int(os.getenv("UPLOADS_PORT", "8080"))
+    start_uploads_server(port=uploads_port)
     dp.update.middleware(UpdateLoggingMiddleware())
     me = await bot.get_me()
     log.info("Bot started as @%s (%s)", me.username, me.id)
