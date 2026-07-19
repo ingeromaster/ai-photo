@@ -11,6 +11,7 @@ from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+from urllib.parse import urlparse
 
 import requests
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
@@ -23,12 +24,26 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     Message,
     TelegramObject,
 )
 from dotenv import load_dotenv
 
-from db import ensure_user, list_telegram_ids, remaining_quota, try_consume_generation
+from db import (
+    MAX_REFERENCE_PACKS,
+    count_packs,
+    create_pack,
+    delete_pack,
+    ensure_user,
+    get_images_for_packs,
+    list_packs,
+    list_telegram_ids,
+    next_pack_title,
+    remaining_quota,
+    rename_pack,
+    try_consume_generation,
+)
 from kie_client import (
     GENERATED_DIR,
     MAX_REFERENCE_IMAGES,
@@ -91,9 +106,17 @@ class UpdateLoggingMiddleware(BaseMiddleware):
 
 
 class GenFSM(StatesGroup):
-    collecting = State()
+    idle = State()
+    adding_refs = State()
+    naming_pack = State()
+    renaming_pack = State()
+    choosing_packs = State()
+    awaiting_prompt = State()
     choose_resolution = State()
     choose_aspect = State()
+
+
+MAX_PACK_TITLE_LEN = 64
 
 
 RESOLUTIONS = [
@@ -112,6 +135,104 @@ ASPECTS = [
     ("3:4", "3:4"),
     ("auto", "auto"),
 ]
+
+
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🎨 Новая генерация", callback_data="menu:generate")],
+            [InlineKeyboardButton(text="📁 Мои референсы", callback_data="menu:refs")],
+            [InlineKeyboardButton(text="❓ Помощь", callback_data="menu:help")],
+        ]
+    )
+
+
+def generate_refs_keyboard(*, has_packs: bool) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="Без референсов", callback_data="gen:none")],
+    ]
+    if has_packs:
+        rows.append(
+            [InlineKeyboardButton(text="Выбрать сохранённый набор", callback_data="gen:pick")]
+        )
+    rows.append(
+        [InlineKeyboardButton(text="Загрузить новый набор", callback_data="gen:upload")]
+    )
+    rows.append([InlineKeyboardButton(text="« В меню", callback_data="menu:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def packs_select_keyboard(packs: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for pack in packs:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{pack['title']} ({pack['image_count']})",
+                    callback_data=f"pack:{pack['id']}",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="Назад", callback_data="gen:start")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def packs_manage_keyboard(packs: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for pack in packs:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"👁 {pack['title']} ({pack['image_count']})",
+                    callback_data=f"refs:view:{pack['id']}",
+                ),
+                InlineKeyboardButton(
+                    text="✏️",
+                    callback_data=f"refs:rename:{pack['id']}",
+                ),
+                InlineKeyboardButton(
+                    text="🗑",
+                    callback_data=f"refs:del:{pack['id']}",
+                ),
+            ]
+        )
+    rows.append(
+        [InlineKeyboardButton(text="➕ Добавить набор", callback_data="refs:add")]
+    )
+    rows.append([InlineKeyboardButton(text="« В меню", callback_data="menu:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def save_refs_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💾 Сохранить набор", callback_data="refs:save")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
+        ]
+    )
+
+
+def name_pack_keyboard(*, auto_title: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"Авто: {auto_title}",
+                    callback_data="refs:autoname",
+                )
+            ],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
+        ]
+    )
+
+
+def normalize_pack_title(raw: str) -> str | None:
+    title = " ".join((raw or "").split())
+    if not title:
+        return None
+    if len(title) > MAX_PACK_TITLE_LEN:
+        title = title[:MAX_PACK_TITLE_LEN].rstrip()
+    return title
 
 
 def resolution_keyboard() -> InlineKeyboardMarkup:
@@ -140,14 +261,15 @@ def aspect_keyboard() -> InlineKeyboardMarkup:
 HELP_TEXT = (
     "AI Photosessions — Nano Banana Pro\n\n"
     "Как пользоваться:\n"
-    "1) Пришлите до 8 референс-фото (можно альбомом) — необязательно\n"
-    "2) Отправьте текстовый промпт\n"
-    "3) Выберите качество и формат кадра\n"
-    "4) Получите результат\n\n"
+    "1) Сохраните до 5 референс-наборов (в каждом до 8 фото) и дайте им названия\n"
+    "2) При генерации выберите один сохранённый набор\n"
+    "3) Бот покажет выбранные фото снова — проверьте их\n"
+    "4) Отправьте промпт → качество → формат\n\n"
     "Команды:\n"
-    "/start — справка\n"
-    "/new — начать заново\n"
-    "/cancel — отменить текущую сессию\n\n"
+    "/start — меню\n"
+    "/new — в меню (наборы не удаляются)\n"
+    "/refs — мои референсы\n"
+    "/cancel — отменить текущий шаг\n\n"
     "Лимит: 10 генераций на аккаунт (можно увеличить у администратора)."
 )
 
@@ -160,6 +282,22 @@ async def _sync_user(message: Message) -> dict:
         username=user.username,
         first_name=user.first_name,
     )
+
+
+async def _go_idle(message: Message, state: FSMContext, *, text: str | None = None) -> None:
+    await state.clear()
+    await state.set_state(GenFSM.idle)
+    await state.update_data(
+        pending_refs=[],
+        selected_pack_ids=[],
+        active_refs=[],
+        prompt=None,
+        resolution=None,
+        aspect_ratio=None,
+        after_save_use=False,
+    )
+    body = text or "Выберите действие:"
+    await message.answer(body, reply_markup=main_menu_keyboard())
 
 
 def _generate_sync(prompt: str, image_urls: list[str], resolution: str, aspect_ratio: str) -> dict:
@@ -273,24 +411,128 @@ async def _send_generated_result(
         )
 
 
+def _local_path_from_public_url(public_url: str) -> str | None:
+    path = urlparse(public_url).path
+    if "/uploads/" not in path:
+        return None
+    name = path.rsplit("/", 1)[-1]
+    return name or None
+
+
+async def _resend_reference_photos(
+    message: Message,
+    refs: list[dict[str, Any]],
+    *,
+    caption: str,
+) -> None:
+    if not refs:
+        return
+    media: list[InputMediaPhoto] = []
+    for idx, item in enumerate(refs):
+        media.append(
+            InputMediaPhoto(
+                media=item["telegram_file_id"],
+                caption=caption if idx == 0 else None,
+            )
+        )
+    try:
+        await message.answer_media_group(media)
+    except TelegramBadRequest as exc:
+        log.warning("refs.resend_failed error=%s — fallback to urls count=%s", exc, len(refs))
+        await message.answer(f"{caption}\n(не удалось повторно показать фото: {exc})")
+
+
+async def _begin_prompt_with_refs(
+    message: Message,
+    state: FSMContext,
+    refs: list[dict[str, Any]],
+    *,
+    intro: str,
+) -> None:
+    await state.update_data(active_refs=refs, prompt=None)
+    await state.set_state(GenFSM.awaiting_prompt)
+    if refs:
+        await _resend_reference_photos(
+            message,
+            refs,
+            caption="Референсы для этой генерации:",
+        )
+        await message.answer(
+            f"{intro}\n"
+            f"Референсов: {len(refs)}.\n"
+            "Теперь отправьте текстовый промпт."
+        )
+    else:
+        await message.answer(
+            f"{intro}\n"
+            "Референсы не выбраны.\n"
+            "Отправьте текстовый промпт."
+        )
+
+
+async def _show_generate_start(message: Message, state: FSMContext, user_id: int) -> None:
+    packs = await asyncio.to_thread(list_packs, user_id)
+    await state.set_state(GenFSM.idle)
+    await state.update_data(selected_pack_ids=[], active_refs=[], pending_refs=[])
+    await message.answer(
+        "Новая генерация.\nКак использовать референсы?",
+        reply_markup=generate_refs_keyboard(has_packs=bool(packs)),
+    )
+
+
+async def _show_refs_manager(message: Message, user_id: int) -> None:
+    packs = await asyncio.to_thread(list_packs, user_id)
+    if not packs:
+        await message.answer(
+            "Сохранённых референсов пока нет.\n"
+            "Добавьте набор фото — он сохранится и будет доступен для следующих генераций.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="➕ Добавить набор", callback_data="refs:add")],
+                    [InlineKeyboardButton(text="« В меню", callback_data="menu:home")],
+                ]
+            ),
+        )
+        return
+    await message.answer(
+        f"Ваши референс-наборы ({len(packs)}/{MAX_REFERENCE_PACKS}):\n"
+        "👁 — посмотреть, ✏️ — переименовать, 🗑 — удалить.",
+        reply_markup=packs_manage_keyboard(packs),
+    )
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await state.set_state(GenFSM.collecting)
-    await state.update_data(photos=[], prompt=None, resolution=None, aspect_ratio=None)
     user = await _sync_user(message)
-    await message.answer(
-        f"{HELP_TEXT}\n"
-        f"Осталось генераций: {user['left_count']}"
+    await _go_idle(
+        message,
+        state,
+        text=(
+            f"{HELP_TEXT}\n"
+            f"Осталось генераций: {user['left_count']}"
+        ),
     )
 
 
 @dp.message(Command("new"))
 async def cmd_new(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await state.set_state(GenFSM.collecting)
-    await state.update_data(photos=[], prompt=None, resolution=None, aspect_ratio=None)
-    await message.answer("Сессия сброшена. Пришлите фото (до 8) и/или промпт.")
+    await _sync_user(message)
+    await _go_idle(
+        message,
+        state,
+        text="Сессия сброшена. Сохранённые референсы на месте. Выберите действие:",
+    )
+
+
+@dp.message(Command("refs"))
+async def cmd_refs(message: Message, state: FSMContext) -> None:
+    await _sync_user(message)
+    current = await state.get_state()
+    if current not in {GenFSM.idle.state, None}:
+        # Allow browsing packs without killing an in-progress generate unless adding.
+        pass
+    await state.set_state(GenFSM.idle)
+    await _show_refs_manager(message, message.from_user.id)
 
 
 @dp.message(Command("broadcast"))
@@ -300,7 +542,6 @@ async def cmd_broadcast(message: Message) -> None:
         return
 
     text = (message.text or "")
-    # Support "/broadcast text" and "/broadcast@bot text"
     parts = text.split(maxsplit=1)
     payload = parts[1].strip() if len(parts) > 1 else ""
     if not payload:
@@ -356,15 +597,232 @@ async def cmd_broadcast(message: Message) -> None:
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await message.answer("Отменено. Нажмите /start или /new, чтобы начать снова.")
+    await _go_idle(message, state, text="Отменено. Выберите действие:")
 
 
 @dp.callback_query(F.data == "cancel")
 async def cb_cancel(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
-    await callback.message.answer("Отменено. Нажмите /start или /new.")
+    await _go_idle(callback.message, state, text="Отменено. Выберите действие:")
     await callback.answer()
+
+
+@dp.callback_query(F.data == "menu:home")
+async def cb_menu_home(callback: CallbackQuery, state: FSMContext) -> None:
+    await _go_idle(callback.message, state)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "menu:help")
+async def cb_menu_help(callback: CallbackQuery, state: FSMContext) -> None:
+    user = await asyncio.to_thread(
+        ensure_user,
+        callback.from_user.id,
+        username=callback.from_user.username,
+        first_name=callback.from_user.first_name,
+    )
+    await callback.message.answer(
+        f"{HELP_TEXT}\nОсталось генераций: {user['left_count']}",
+        reply_markup=main_menu_keyboard(),
+    )
+    await state.set_state(GenFSM.idle)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "menu:generate")
+@dp.callback_query(F.data == "gen:start")
+async def cb_menu_generate(callback: CallbackQuery, state: FSMContext) -> None:
+    await asyncio.to_thread(
+        ensure_user,
+        callback.from_user.id,
+        username=callback.from_user.username,
+        first_name=callback.from_user.first_name,
+    )
+    await _show_generate_start(callback.message, state, callback.from_user.id)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "menu:refs")
+async def cb_menu_refs(callback: CallbackQuery, state: FSMContext) -> None:
+    await asyncio.to_thread(
+        ensure_user,
+        callback.from_user.id,
+        username=callback.from_user.username,
+        first_name=callback.from_user.first_name,
+    )
+    await state.set_state(GenFSM.idle)
+    await _show_refs_manager(callback.message, callback.from_user.id)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "gen:none")
+async def cb_gen_none(callback: CallbackQuery, state: FSMContext) -> None:
+    await _begin_prompt_with_refs(
+        callback.message,
+        state,
+        [],
+        intro="Ок, генерация без референсов.",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "gen:pick")
+async def cb_gen_pick(callback: CallbackQuery, state: FSMContext) -> None:
+    user_id = callback.from_user.id
+    packs = await asyncio.to_thread(list_packs, user_id)
+    if not packs:
+        await callback.message.answer(
+            "Сохранённых наборов нет. Загрузите новый.",
+            reply_markup=generate_refs_keyboard(has_packs=False),
+        )
+        await callback.answer()
+        return
+    await state.set_state(GenFSM.choosing_packs)
+    await state.update_data(selected_pack_ids=[])
+    await callback.message.answer(
+        "Выберите один набор референсов.\n"
+        f"В наборе может быть до {MAX_REFERENCE_IMAGES} фото.",
+        reply_markup=packs_select_keyboard(packs),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(GenFSM.choosing_packs, F.data.startswith("pack:"))
+async def cb_select_pack(callback: CallbackQuery, state: FSMContext) -> None:
+    pack_id = int(callback.data.split(":", 1)[1])
+    images = await asyncio.to_thread(
+        get_images_for_packs,
+        callback.from_user.id,
+        [pack_id],
+    )
+    if not images:
+        await callback.answer("Набор не найден или пуст", show_alert=True)
+        return
+
+    truncated = len(images) > MAX_REFERENCE_IMAGES
+    if truncated:
+        images = images[:MAX_REFERENCE_IMAGES]
+
+    title = images[0].get("pack_title") or f"Набор {pack_id}"
+    await state.update_data(selected_pack_ids=[pack_id])
+    intro = f"Выбран набор «{title}»."
+    if truncated:
+        intro += f"\nВзяты первые {MAX_REFERENCE_IMAGES} фото (лимит)."
+
+    await _begin_prompt_with_refs(callback.message, state, images, intro=intro)
+    await callback.answer()
+
+@dp.callback_query(F.data == "gen:upload")
+@dp.callback_query(F.data == "refs:add")
+async def cb_start_upload(callback: CallbackQuery, state: FSMContext) -> None:
+    user_id = callback.from_user.id
+    await asyncio.to_thread(
+        ensure_user,
+        user_id,
+        username=callback.from_user.username,
+        first_name=callback.from_user.first_name,
+    )
+    pack_count = await asyncio.to_thread(count_packs, user_id)
+    if pack_count >= MAX_REFERENCE_PACKS:
+        await callback.message.answer(
+            f"Достигнут лимит наборов ({MAX_REFERENCE_PACKS}). "
+            "Удалите старый в «Мои референсы»."
+        )
+        await callback.answer()
+        return
+
+    after_save_use = callback.data == "gen:upload"
+    await state.set_state(GenFSM.adding_refs)
+    await state.update_data(pending_refs=[], after_save_use=after_save_use)
+    await callback.message.answer(
+        f"Пришлите до {MAX_REFERENCE_IMAGES} фото (можно альбомом).\n"
+        "Когда закончите — нажмите «Сохранить набор».",
+        reply_markup=save_refs_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("refs:view:"))
+async def cb_refs_view(callback: CallbackQuery) -> None:
+    pack_id = int(callback.data.split(":")[-1])
+    images = await asyncio.to_thread(
+        get_images_for_packs,
+        callback.from_user.id,
+        [pack_id],
+    )
+    if not images:
+        await callback.answer("Набор не найден", show_alert=True)
+        return
+    title = images[0].get("pack_title") or f"Набор {pack_id}"
+    await _resend_reference_photos(
+        callback.message,
+        images,
+        caption=f"{title} · {len(images)} фото",
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("refs:del:"))
+async def cb_refs_del(callback: CallbackQuery, state: FSMContext) -> None:
+    pack_id = int(callback.data.split(":")[-1])
+    deleted = await asyncio.to_thread(delete_pack, pack_id, callback.from_user.id)
+    if deleted:
+        log.info("refs.pack_deleted user=%s pack_id=%s", callback.from_user.id, pack_id)
+        await callback.answer("Удалено")
+    else:
+        await callback.answer("Набор не найден", show_alert=True)
+    await state.set_state(GenFSM.idle)
+    await _show_refs_manager(callback.message, callback.from_user.id)
+
+
+@dp.callback_query(F.data.startswith("refs:rename:"))
+async def cb_refs_rename(callback: CallbackQuery, state: FSMContext) -> None:
+    pack_id = int(callback.data.split(":")[-1])
+    packs = await asyncio.to_thread(list_packs, callback.from_user.id)
+    pack = next((p for p in packs if p["id"] == pack_id), None)
+    if not pack:
+        await callback.answer("Набор не найден", show_alert=True)
+        return
+    await state.set_state(GenFSM.renaming_pack)
+    await state.update_data(rename_pack_id=pack_id)
+    await callback.message.answer(
+        f"Текущее название: «{pack['title']}».\n"
+        f"Пришлите новое название (до {MAX_PACK_TITLE_LEN} символов).",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="menu:refs")],
+            ]
+        ),
+    )
+    await callback.answer()
+
+
+@dp.message(GenFSM.renaming_pack, F.text)
+async def on_rename_pack_title(message: Message, state: FSMContext) -> None:
+    title = normalize_pack_title(message.text or "")
+    if not title or title.startswith("/"):
+        await message.answer(
+            f"Нужно текстовое название (1–{MAX_PACK_TITLE_LEN} символов)."
+        )
+        return
+    data = await state.get_data()
+    pack_id = data.get("rename_pack_id")
+    if not pack_id:
+        await _go_idle(message, state, text="Сессия сброшена. Выберите действие:")
+        return
+    ok = await asyncio.to_thread(rename_pack, int(pack_id), message.from_user.id, title)
+    if not ok:
+        await message.answer("Не удалось переименовать: набор не найден.")
+    else:
+        log.info(
+            "refs.pack_renamed user=%s pack_id=%s title=%s",
+            message.from_user.id,
+            pack_id,
+            title,
+        )
+        await message.answer(f"Набор переименован в «{title}».")
+    await state.set_state(GenFSM.idle)
+    await state.update_data(rename_pack_id=None)
+    await _show_refs_manager(message, message.from_user.id)
 
 
 async def _download_telegram_file(file_id: str) -> tuple[bytes, str]:
@@ -392,43 +850,44 @@ def _save_one_reference(data: bytes, filename: str, mime: str) -> str:
     return save_reference_bytes(data, filename, mime)
 
 
-def _photo_added_text(count: int) -> str:
+def _pending_added_text(count: int) -> str:
     return (
-        f"Фото {count}/{MAX_REFERENCE_IMAGES} добавлено.\n"
-        "Можете прислать ещё или отправить промпт текстом."
+        f"Фото {count}/{MAX_REFERENCE_IMAGES} в новом наборе.\n"
+        "Можете прислать ещё или нажать «Сохранить набор»."
     )
 
 
-async def _append_photos_and_reply(
+async def _append_pending_and_reply(
     message: Message,
     state: FSMContext,
-    new_urls: list[str],
+    new_items: list[dict[str, str]],
 ) -> None:
-    if not new_urls:
+    if not new_items:
         return
 
     user_id = message.from_user.id
     async with _user_photo_locks[user_id]:
         data = await state.get_data()
-        photos: list[str] = list(data.get("photos") or [])
-        free = MAX_REFERENCE_IMAGES - len(photos)
+        pending: list[dict[str, str]] = list(data.get("pending_refs") or [])
+        free = MAX_REFERENCE_IMAGES - len(pending)
         if free <= 0:
             await message.answer(
-                f"Уже максимум {MAX_REFERENCE_IMAGES} фото. Пришлите промпт текстом."
+                f"Уже максимум {MAX_REFERENCE_IMAGES} фото. Нажмите «Сохранить набор».",
+                reply_markup=save_refs_keyboard(),
             )
             return
-        truncated = len(new_urls) > free
+        truncated = len(new_items) > free
         if truncated:
-            new_urls = new_urls[:free]
-        photos.extend(new_urls)
-        await state.update_data(photos=photos)
-        count = len(photos)
+            new_items = new_items[:free]
+        pending.extend(new_items)
+        await state.update_data(pending_refs=pending)
+        count = len(pending)
 
-    log.info("refs.added user=%s count=%s added=%s", user_id, count, len(new_urls))
-    text = _photo_added_text(count)
+    log.info("refs.pending_added user=%s count=%s added=%s", user_id, count, len(new_items))
+    text = _pending_added_text(count)
     if truncated:
         text += f"\nЧасть фото не принята: лимит {MAX_REFERENCE_IMAGES}."
-    await message.answer(text)
+    await message.answer(text, reply_markup=save_refs_keyboard())
 
 
 async def _finalize_album(album_key: str) -> None:
@@ -439,10 +898,14 @@ async def _finalize_album(album_key: str) -> None:
 
     async with _album_lock:
         album = _albums.pop(album_key, None)
-    if not album or not album.get("urls"):
+    if not album or not album.get("items"):
         return
 
-    await _append_photos_and_reply(album["message"], album["state"], list(album["urls"]))
+    await _append_pending_and_reply(
+        album["message"],
+        album["state"],
+        list(album["items"]),
+    )
 
 
 async def _handle_incoming_image(
@@ -463,18 +926,24 @@ async def _handle_incoming_image(
         await message.answer(f"Не удалось сохранить фото: {exc}")
         return
 
+    item = {
+        "telegram_file_id": file_id,
+        "public_url": url,
+        "local_path": _local_path_from_public_url(url) or "",
+    }
+
     media_group_id = message.media_group_id
     if not media_group_id:
-        await _append_photos_and_reply(message, state, [url])
+        await _append_pending_and_reply(message, state, [item])
         return
 
     album_key = f"{message.from_user.id}:{media_group_id}"
     async with _album_lock:
         album = _albums.get(album_key)
         if album is None:
-            album = {"urls": [], "message": message, "state": state, "task": None}
+            album = {"items": [], "message": message, "state": state, "task": None}
             _albums[album_key] = album
-        album["urls"].append(url)
+        album["items"].append(item)
         album["message"] = message
         album["state"] = state
         old_task = album.get("task")
@@ -483,7 +952,7 @@ async def _handle_incoming_image(
         album["task"] = asyncio.create_task(_finalize_album(album_key))
 
 
-@dp.message(GenFSM.collecting, F.photo)
+@dp.message(GenFSM.adding_refs, F.photo)
 async def on_photo(message: Message, state: FSMContext) -> None:
     photo = message.photo[-1]
     await _handle_incoming_image(
@@ -495,7 +964,7 @@ async def on_photo(message: Message, state: FSMContext) -> None:
     )
 
 
-@dp.message(GenFSM.collecting, F.document)
+@dp.message(GenFSM.adding_refs, F.document)
 async def on_document(message: Message, state: FSMContext) -> None:
     doc = message.document
     if not doc:
@@ -517,7 +986,119 @@ async def on_document(message: Message, state: FSMContext) -> None:
     )
 
 
-@dp.message(GenFSM.collecting, F.text)
+@dp.callback_query(GenFSM.adding_refs, F.data == "refs:save")
+async def cb_save_pack(callback: CallbackQuery, state: FSMContext) -> None:
+    user_id = callback.from_user.id
+
+    for _ in range(10):
+        async with _album_lock:
+            pending_album = any(k.startswith(f"{user_id}:") for k in _albums)
+        if not pending_album:
+            break
+        await asyncio.sleep(0.4)
+
+    data = await state.get_data()
+    pending: list[dict[str, str]] = list(data.get("pending_refs") or [])
+    if not pending:
+        await callback.answer("Сначала пришлите хотя бы одно фото", show_alert=True)
+        return
+
+    pack_count = await asyncio.to_thread(count_packs, user_id)
+    if pack_count >= MAX_REFERENCE_PACKS:
+        await callback.message.answer(
+            f"Лимит наборов ({MAX_REFERENCE_PACKS}). Удалите старый и попробуйте снова."
+        )
+        await callback.answer()
+        return
+
+    auto_title = await asyncio.to_thread(next_pack_title, user_id)
+    await state.set_state(GenFSM.naming_pack)
+    await callback.message.answer(
+        f"Фото готовы: {len(pending)}.\n"
+        f"Пришлите название набора (до {MAX_PACK_TITLE_LEN} символов)\n"
+        "или нажмите автоназвание.",
+        reply_markup=name_pack_keyboard(auto_title=auto_title),
+    )
+    await callback.answer()
+
+
+async def _finalize_named_pack(
+    message: Message,
+    state: FSMContext,
+    *,
+    user_id: int,
+    title: str,
+) -> None:
+    data = await state.get_data()
+    pending: list[dict[str, str]] = list(data.get("pending_refs") or [])
+    if not pending:
+        await message.answer("Нет фото для сохранения. Начните заново через «Добавить набор».")
+        await state.set_state(GenFSM.idle)
+        await _show_refs_manager(message, user_id)
+        return
+
+    pack_count = await asyncio.to_thread(count_packs, user_id)
+    if pack_count >= MAX_REFERENCE_PACKS:
+        await message.answer(
+            f"Лимит наборов ({MAX_REFERENCE_PACKS}). Удалите старый и попробуйте снова."
+        )
+        await state.set_state(GenFSM.idle)
+        await _show_refs_manager(message, user_id)
+        return
+
+    pack = await asyncio.to_thread(create_pack, user_id, title, pending)
+    after_save_use = bool(data.get("after_save_use"))
+    log.info(
+        "refs.pack_created user=%s pack_id=%s images=%s title=%s use_now=%s",
+        user_id,
+        pack["id"],
+        pack["image_count"],
+        title,
+        after_save_use,
+    )
+
+    await state.update_data(pending_refs=[])
+    await message.answer(f"Набор «{title}» сохранён ({pack['image_count']} фото).")
+
+    if after_save_use:
+        await _begin_prompt_with_refs(
+            message,
+            state,
+            pack["images"],
+            intro=f"Используем только что сохранённый «{title}».",
+        )
+    else:
+        await state.set_state(GenFSM.idle)
+        await _show_refs_manager(message, user_id)
+
+
+@dp.callback_query(GenFSM.naming_pack, F.data == "refs:autoname")
+async def cb_auto_name_pack(callback: CallbackQuery, state: FSMContext) -> None:
+    user_id = callback.from_user.id
+    title = await asyncio.to_thread(next_pack_title, user_id)
+    await _finalize_named_pack(callback.message, state, user_id=user_id, title=title)
+    await callback.answer("Сохранено")
+
+
+@dp.message(GenFSM.naming_pack, F.text)
+async def on_pack_title(message: Message, state: FSMContext) -> None:
+    title = normalize_pack_title(message.text or "")
+    if not title or title.startswith("/"):
+        auto_title = await asyncio.to_thread(next_pack_title, message.from_user.id)
+        await message.answer(
+            f"Нужно текстовое название (1–{MAX_PACK_TITLE_LEN} символов).\n"
+            "Или нажмите автоназвание.",
+            reply_markup=name_pack_keyboard(auto_title=auto_title),
+        )
+        return
+    await _finalize_named_pack(
+        message,
+        state,
+        user_id=message.from_user.id,
+        title=title,
+    )
+
+@dp.message(GenFSM.awaiting_prompt, F.text)
 async def on_prompt(message: Message, state: FSMContext) -> None:
     prompt = (message.text or "").strip()
     if not prompt or prompt.startswith("/"):
@@ -536,20 +1117,19 @@ async def on_prompt(message: Message, state: FSMContext) -> None:
         )
         return
 
-    for _ in range(10):
-        async with _album_lock:
-            pending = any(k.startswith(f"{user_id}:") for k in _albums)
-        if not pending:
-            break
-        await asyncio.sleep(0.4)
-
     data = await state.get_data()
-    photos = data.get("photos") or []
+    refs = data.get("active_refs") or []
     await state.update_data(prompt=prompt)
     await state.set_state(GenFSM.choose_resolution)
-    log.info("prompt.accepted user=%s refs=%s prompt_len=%s left=%s", user_id, len(photos), len(prompt), left)
+    log.info(
+        "prompt.accepted user=%s refs=%s prompt_len=%s left=%s",
+        user_id,
+        len(refs),
+        len(prompt),
+        left,
+    )
     await message.answer(
-        f"Промпт принят. Референсов: {len(photos)}.\n"
+        f"Промпт принят. Референсов: {len(refs)}.\n"
         f"Осталось генераций: {left}\n"
         "Выберите качество:",
         reply_markup=resolution_keyboard(),
@@ -574,11 +1154,12 @@ async def on_aspect(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     prompt = data.get("prompt")
     resolution = data.get("resolution") or "1K"
-    photos = data.get("photos") or []
+    refs = data.get("active_refs") or []
+    photos = [item["public_url"] for item in refs if item.get("public_url")]
 
     if not prompt:
         await callback.message.answer("Промпт потерян. Нажмите /new и начните снова.")
-        await state.clear()
+        await _go_idle(callback.message, state)
         await callback.answer()
         return
 
@@ -595,11 +1176,12 @@ async def on_aspect(callback: CallbackQuery, state: FSMContext) -> None:
             "Лимит генераций исчерпан.\n"
             "Напишите администратору, чтобы увеличить квоту."
         )
-        await state.clear()
+        await _go_idle(callback.message, state)
         await callback.answer()
         return
 
-    await state.clear()
+    await state.set_state(GenFSM.idle)
+    await state.update_data(prompt=None, active_refs=[], selected_pack_ids=[])
     await callback.message.answer(
         f"Генерация {resolution} {aspect}, референсов: {len(photos)}…\nОбычно 20–90 секунд."
     )
@@ -626,6 +1208,7 @@ async def on_aspect(callback: CallbackQuery, state: FSMContext) -> None:
     except Exception as exc:  # noqa: BLE001
         log.exception("generate.failed user=%s error=%s", user_id, exc)
         await callback.message.answer(f"Ошибка генерации: {exc}")
+        await callback.message.answer("Выберите действие:", reply_markup=main_menu_keyboard())
         return
 
     await _send_generated_result(
@@ -637,13 +1220,58 @@ async def on_aspect(callback: CallbackQuery, state: FSMContext) -> None:
         task_id=result["taskId"],
         left_count=consumed["left_count"],
     )
+    await callback.message.answer(
+        "Можно сделать ещё одну генерацию — референсы уже сохранены.",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+@dp.message(F.photo)
+@dp.message(F.document)
+async def fallback_media(message: Message, state: FSMContext) -> None:
+    current = await state.get_state()
+    if current == GenFSM.adding_refs.state:
+        return
+    await message.answer(
+        "Чтобы сохранить фото как референсы, откройте «Мои референсы» → «Добавить набор» "
+        "или «Новая генерация» → «Загрузить новый набор».",
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 @dp.message(F.text)
 async def fallback_text(message: Message, state: FSMContext) -> None:
     current = await state.get_state()
-    if current is None:
-        await message.answer("Нажмите /start, затем пришлите фото и промпт.")
+    if current is None or current == GenFSM.idle.state:
+        await message.answer(
+            "Выберите действие в меню или нажмите /start.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+    if current == GenFSM.adding_refs.state:
+        await message.answer(
+            "Сейчас ждём фото для набора. Пришлите изображения или нажмите «Сохранить набор».",
+            reply_markup=save_refs_keyboard(),
+        )
+        return
+    if current == GenFSM.naming_pack.state:
+        auto_title = await asyncio.to_thread(next_pack_title, message.from_user.id)
+        await message.answer(
+            f"Пришлите название набора текстом (до {MAX_PACK_TITLE_LEN} символов)\n"
+            "или нажмите автоназвание.",
+            reply_markup=name_pack_keyboard(auto_title=auto_title),
+        )
+        return
+    if current == GenFSM.renaming_pack.state:
+        await message.answer(
+            f"Пришлите новое название набора текстом (до {MAX_PACK_TITLE_LEN} символов)."
+        )
+        return
+    if current == GenFSM.choosing_packs.state:
+        await message.answer("Выберите один набор кнопкой выше.")
+        return
+    if current in {GenFSM.choose_resolution.state, GenFSM.choose_aspect.state}:
+        await message.answer("Выберите вариант кнопками выше или /cancel.")
 
 
 async def main() -> None:
