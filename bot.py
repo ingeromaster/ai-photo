@@ -137,14 +137,86 @@ ASPECTS = [
 ]
 
 
-def main_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+def main_menu_keyboard(*, has_repeat: bool = False) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if has_repeat:
+        rows.append(
+            [InlineKeyboardButton(text="🔁 Повторить генерацию", callback_data="gen:repeat")]
+        )
+    rows.extend(
+        [
             [InlineKeyboardButton(text="🎨 Новая генерация", callback_data="menu:generate")],
             [InlineKeyboardButton(text="📁 Мои референсы", callback_data="menu:refs")],
             [InlineKeyboardButton(text="❓ Помощь", callback_data="menu:help")],
         ]
     )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+QUOTA_PACKAGES = [
+    (10, "149 ₽"),
+    (20, "249 ₽"),
+    (50, "699 ₽"),
+    (100, "1 299 ₽"),
+    (300, "3 499 ₽"),
+]
+
+QUOTA_EXHAUSTED_TEXT = (
+    "У вас закончились генерации.\n"
+    "Для продолжения пополните баланс:"
+)
+
+
+def pricing_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"{count} генераций — {price}",
+                callback_data=f"pay:{count}",
+            )
+        ]
+        for count, price in QUOTA_PACKAGES
+    ]
+    rows.append([InlineKeyboardButton(text="« Назад", callback_data="pay:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _show_quota_exhausted(message: Message) -> None:
+    await message.answer(QUOTA_EXHAUSTED_TEXT, reply_markup=pricing_keyboard())
+
+
+def _last_gen_valid(last_gen: Any) -> bool:
+    return bool(
+        isinstance(last_gen, dict)
+        and last_gen.get("prompt")
+        and last_gen.get("resolution")
+        and last_gen.get("aspect")
+    )
+
+
+async def _menu_keyboard(state: FSMContext) -> InlineKeyboardMarkup:
+    data = await state.get_data()
+    return main_menu_keyboard(has_repeat=_last_gen_valid(data.get("last_gen")))
+
+
+async def _go_idle(message: Message, state: FSMContext, *, text: str | None = None) -> None:
+    data = await state.get_data()
+    last_gen = data.get("last_gen") if _last_gen_valid(data.get("last_gen")) else None
+    await state.clear()
+    await state.set_state(GenFSM.idle)
+    await state.update_data(
+        pending_refs=[],
+        selected_pack_ids=[],
+        active_refs=[],
+        prompt=None,
+        resolution=None,
+        aspect_ratio=None,
+        after_save_use=False,
+        last_gen=last_gen,
+    )
+    body = text or "Выберите действие:"
+    await message.answer(body, reply_markup=main_menu_keyboard(has_repeat=bool(last_gen)))
+
 
 
 def generate_refs_keyboard(*, has_packs: bool) -> InlineKeyboardMarkup:
@@ -264,7 +336,8 @@ HELP_TEXT = (
     "1) Сохраните до 5 референс-наборов (в каждом до 8 фото) и дайте им названия\n"
     "2) При генерации выберите один сохранённый набор\n"
     "3) Бот покажет выбранные фото снова — проверьте их\n"
-    "4) Отправьте промпт → качество → формат\n\n"
+    "4) Отправьте промпт → качество → формат\n"
+    "5) После результата можно нажать «Повторить генерацию» с теми же настройками\n\n"
     "Команды:\n"
     "/start — меню\n"
     "/new — в меню (наборы не удаляются)\n"
@@ -282,22 +355,6 @@ async def _sync_user(message: Message) -> dict:
         username=user.username,
         first_name=user.first_name,
     )
-
-
-async def _go_idle(message: Message, state: FSMContext, *, text: str | None = None) -> None:
-    await state.clear()
-    await state.set_state(GenFSM.idle)
-    await state.update_data(
-        pending_refs=[],
-        selected_pack_ids=[],
-        active_refs=[],
-        prompt=None,
-        resolution=None,
-        aspect_ratio=None,
-        after_save_use=False,
-    )
-    body = text or "Выберите действие:"
-    await message.answer(body, reply_markup=main_menu_keyboard())
 
 
 def _generate_sync(prompt: str, image_urls: list[str], resolution: str, aspect_ratio: str) -> dict:
@@ -612,6 +669,19 @@ async def cb_menu_home(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
+@dp.callback_query(F.data == "pay:back")
+async def cb_pay_back(callback: CallbackQuery, state: FSMContext) -> None:
+    await _go_idle(callback.message, state, text="Выберите действие:")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("pay:") & ~F.data.in_({"pay:back"}))
+async def cb_pay_package(callback: CallbackQuery) -> None:
+    # Stub: real payments will be wired later.
+    await callback.message.answer("Оплата пока недоступна. Попробуйте позже")
+    await callback.answer()
+
+
 @dp.callback_query(F.data == "menu:help")
 async def cb_menu_help(callback: CallbackQuery, state: FSMContext) -> None:
     user = await asyncio.to_thread(
@@ -622,7 +692,7 @@ async def cb_menu_help(callback: CallbackQuery, state: FSMContext) -> None:
     )
     await callback.message.answer(
         f"{HELP_TEXT}\nОсталось генераций: {user['left_count']}",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=await _menu_keyboard(state),
     )
     await state.set_state(GenFSM.idle)
     await callback.answer()
@@ -1111,10 +1181,7 @@ async def on_prompt(message: Message, state: FSMContext) -> None:
     await _sync_user(message)
     left = await asyncio.to_thread(remaining_quota, user_id)
     if left <= 0:
-        await message.answer(
-            "Лимит генераций исчерпан.\n"
-            "Напишите администратору, чтобы увеличить квоту."
-        )
+        await _show_quota_exhausted(message)
         return
 
     data = await state.get_data()
@@ -1154,8 +1221,7 @@ async def on_aspect(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     prompt = data.get("prompt")
     resolution = data.get("resolution") or "1K"
-    refs = data.get("active_refs") or []
-    photos = [item["public_url"] for item in refs if item.get("public_url")]
+    refs = list(data.get("active_refs") or [])
 
     if not prompt:
         await callback.message.answer("Промпт потерян. Нажмите /new и начните снова.")
@@ -1163,37 +1229,107 @@ async def on_aspect(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
         return
 
-    user_id = callback.from_user.id
+    await callback.answer()
+    await _run_generation(
+        callback.message,
+        state,
+        user_id=callback.from_user.id,
+        username=callback.from_user.username,
+        first_name=callback.from_user.first_name,
+        prompt=prompt,
+        resolution=resolution,
+        aspect=aspect,
+        refs=refs,
+        repeated=False,
+    )
+
+
+@dp.callback_query(F.data == "gen:repeat")
+async def cb_repeat_generation(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    last_gen = data.get("last_gen")
+    if not _last_gen_valid(last_gen):
+        await callback.answer("Нет предыдущей генерации для повтора", show_alert=True)
+        return
+
+    current = await state.get_state()
+    if current not in {None, GenFSM.idle.state}:
+        await callback.answer(
+            "Сейчас идёт другой шаг. Завершите его или нажмите /cancel.",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer()
+    await _run_generation(
+        callback.message,
+        state,
+        user_id=callback.from_user.id,
+        username=callback.from_user.username,
+        first_name=callback.from_user.first_name,
+        prompt=last_gen["prompt"],
+        resolution=last_gen["resolution"],
+        aspect=last_gen["aspect"],
+        refs=list(last_gen.get("refs") or []),
+        repeated=True,
+    )
+
+
+async def _run_generation(
+    message: Message,
+    state: FSMContext,
+    *,
+    user_id: int,
+    username: str | None,
+    first_name: str | None,
+    prompt: str,
+    resolution: str,
+    aspect: str,
+    refs: list[dict[str, Any]],
+    repeated: bool,
+) -> None:
+    photos = [item["public_url"] for item in refs if item.get("public_url")]
     await asyncio.to_thread(
         ensure_user,
         user_id,
-        username=callback.from_user.username,
-        first_name=callback.from_user.first_name,
+        username=username,
+        first_name=first_name,
     )
     consumed = await asyncio.to_thread(try_consume_generation, user_id)
     if not consumed:
-        await callback.message.answer(
-            "Лимит генераций исчерпан.\n"
-            "Напишите администратору, чтобы увеличить квоту."
-        )
-        await _go_idle(callback.message, state)
-        await callback.answer()
+        await _show_quota_exhausted(message)
+        await state.set_state(GenFSM.idle)
         return
 
+    last_gen = {
+        "prompt": prompt,
+        "resolution": resolution,
+        "aspect": aspect,
+        "refs": refs,
+    }
     await state.set_state(GenFSM.idle)
-    await state.update_data(prompt=None, active_refs=[], selected_pack_ids=[])
-    await callback.message.answer(
-        f"Генерация {resolution} {aspect}, референсов: {len(photos)}…\nОбычно 20–90 секунд."
+    await state.update_data(
+        prompt=None,
+        active_refs=[],
+        selected_pack_ids=[],
+        last_gen=last_gen,
     )
-    await callback.answer()
+
+    prefix = "Повтор генерации" if repeated else "Генерация"
+    await message.answer(
+        f"{prefix} {resolution} {aspect}, референсов: {len(photos)}…\n"
+        "Обычно 20–90 секунд."
+    )
     log.info(
-        "generate.request user=%s resolution=%s aspect=%s refs=%s prompt_len=%s left_after=%s",
+        "generate.request user=%s resolution=%s aspect=%s refs=%s prompt_len=%s "
+        "left_after=%s repeated=%s",
         user_id,
         resolution,
         aspect,
         len(photos),
         len(prompt),
         consumed["left_count"],
+        repeated,
     )
 
     try:
@@ -1207,12 +1343,15 @@ async def on_aspect(callback: CallbackQuery, state: FSMContext) -> None:
             )
     except Exception as exc:  # noqa: BLE001
         log.exception("generate.failed user=%s error=%s", user_id, exc)
-        await callback.message.answer(f"Ошибка генерации: {exc}")
-        await callback.message.answer("Выберите действие:", reply_markup=main_menu_keyboard())
+        await message.answer(f"Ошибка генерации: {exc}")
+        await message.answer(
+            "Выберите действие:",
+            reply_markup=main_menu_keyboard(has_repeat=True),
+        )
         return
 
     await _send_generated_result(
-        callback.message,
+        message,
         path=Path(result["path"]),
         resolution=resolution,
         aspect=aspect,
@@ -1220,9 +1359,9 @@ async def on_aspect(callback: CallbackQuery, state: FSMContext) -> None:
         task_id=result["taskId"],
         left_count=consumed["left_count"],
     )
-    await callback.message.answer(
-        "Можно сделать ещё одну генерацию — референсы уже сохранены.",
-        reply_markup=main_menu_keyboard(),
+    await message.answer(
+        "Можно повторить с теми же настройками или начать новую генерацию.",
+        reply_markup=main_menu_keyboard(has_repeat=True),
     )
 
 
@@ -1235,7 +1374,7 @@ async def fallback_media(message: Message, state: FSMContext) -> None:
     await message.answer(
         "Чтобы сохранить фото как референсы, откройте «Мои референсы» → «Добавить набор» "
         "или «Новая генерация» → «Загрузить новый набор».",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=await _menu_keyboard(state),
     )
 
 
@@ -1245,7 +1384,7 @@ async def fallback_text(message: Message, state: FSMContext) -> None:
     if current is None or current == GenFSM.idle.state:
         await message.answer(
             "Выберите действие в меню или нажмите /start.",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=await _menu_keyboard(state),
         )
         return
     if current == GenFSM.adding_refs.state:
